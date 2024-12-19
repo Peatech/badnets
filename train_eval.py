@@ -3,49 +3,95 @@ from tqdm import tqdm
 from sklearn.metrics import classification_report
 
 
-# Normal training step with the poisoning dataset
-
-
 def train(model, data_loader, criterion, optimizer):
     """
-    Function for model training step
+    Training step for the model.
+    
+    Args:
+        model (torch.nn.Module): The model to train.
+        data_loader (torch.utils.data.DataLoader): DataLoader for the training data.
+        criterion (torch.nn.Module): Loss function.
+        optimizer (torch.optim.Optimizer): Optimizer for model training.
+        
+    Returns:
+        float: Average training loss over the dataset.
     """
-    running_loss = 0
+    running_loss = 0.0
     model.train()
-    for step, (batch_img, batch_label) in enumerate(tqdm(data_loader)):
-        optimizer.zero_grad()  # Set gradients to zero
-        output = model(batch_img)  # Forward pass
-        loss = criterion(output, batch_label)
-        loss.backward()  # Backpropagation
-        optimizer.step()  # Update weights
-        running_loss += loss
-    return running_loss
+
+    for step, (batch_img, batch_label) in enumerate(tqdm(data_loader, desc="Training")):
+        # Move data to the same device as the model
+        batch_img, batch_label = batch_img.to(model.device), batch_label.to(model.device)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(batch_img)
+
+        # Compute loss
+        loss = criterion(outputs, batch_label)
+
+        # Backpropagation
+        loss.backward()
+
+        # Update weights
+        optimizer.step()
+
+        # Accumulate loss
+        running_loss += loss.item()
+
+    # Return average loss
+    return running_loss / len(data_loader)
 
 
-# Simple evaluation with the addition of a classification report with precision and recall
-
-
-def eval(model, test_loader, batch_size=64, report=True):
+def eval(model, test_loader, report=True):
     """
-    Simple evaluation with the addition of a classification report.
+    Evaluation step for the model.
+    
+    Args:
+        model (torch.nn.Module): The model to evaluate.
+        test_loader (torch.utils.data.DataLoader): DataLoader for the test data.
+        report (bool): Whether to print a classification report.
+        
+    Returns:
+        float: Accuracy over the test dataset.
     """
-    ret = 0
+    correct = 0
+    total = 0
     preds = []
     gt = []
+
     with torch.no_grad():
         model.eval()
-        for step, (batch_img, batch_label) in enumerate(test_loader):
-            output = model(batch_img)
-            label_predict = torch.argmax(output, dim=1)
-            preds.append(label_predict)
-            batch_label = torch.argmax(batch_label, dim=1)
+
+        for batch_img, batch_label in tqdm(test_loader, desc="Evaluating"):
+            # Move data to the same device as the model
+            batch_img, batch_label = batch_img.to(model.device), batch_label.to(model.device)
+
+            # Forward pass
+            outputs = model(batch_img)
+
+            # Predicted labels
+            predicted = torch.argmax(outputs, dim=1)
+
+            # If labels are one-hot encoded, convert to indices
+            if batch_label.dim() > 1:
+                batch_label = torch.argmax(batch_label, dim=1)
+
+            # Append predictions and ground truths for report
+            preds.append(predicted)
             gt.append(batch_label)
-            ret += torch.sum(batch_label == label_predict)
 
+            # Count correct predictions
+            correct += (predicted == batch_label).sum().item()
+            total += batch_label.size(0)
+
+        # Print classification report
         if report:
-            gt = torch.cat(gt, 0)
-            preds = torch.cat(preds, 0)
-            print(classification_report(gt.cpu(), preds.cpu()))
+            gt = torch.cat(gt).cpu()  # Concatenate ground truths and move to CPU
+            preds = torch.cat(preds).cpu()  # Concatenate predictions and move to CPU
+            print(classification_report(gt, preds))
 
-    return int(ret) / (step * batch_size)
-
+    # Compute and return accuracy
+    return correct / total
