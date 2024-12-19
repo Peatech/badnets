@@ -30,12 +30,11 @@ def main():
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    # Determine input size (channels) based on dataset
-    input_size = 3 if dataset == "cifar" else 1
-    img_dim = 32 if dataset == "cifar" else 28
-
+    # Load dataset and metadata
     print(f"\n# Loading Dataset: {dataset}")
-    train_data, test_data = load_sets(datasetname=dataset, download=True, dataset_path='./data')
+    train_data, test_data, metadata = load_sets(datasetname=dataset, download=True, dataset_path='./data')
+    input_size = metadata['input_channels']
+    img_dim = metadata['img_dim']
 
     print("\n# Creating Poisoned Dataset")
     train_data_loader, test_data_orig_loader, test_data_trig_loader = backdoor_data_loader(
@@ -49,7 +48,7 @@ def main():
     )
 
     # Initialize model
-    badnet = BadNet(input_size=input_size, output=10, img_dim=img_dim).to(device)
+    badnet = BadNet(input_size=input_size, output=metadata['num_classes'], img_dim=img_dim).to(device)
 
     # Loss function and optimizer
     criterion = nn.CrossEntropyLoss()
