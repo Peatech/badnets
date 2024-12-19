@@ -49,7 +49,7 @@ def main():
 
     # Initialize model
     badnet = BadNet(input_size=input_size, output=metadata['num_classes'], img_dim=img_dim).to(device)
-
+    badnet.device = device
     # Loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(badnet.parameters(), lr=0.001, momentum=0.9)
