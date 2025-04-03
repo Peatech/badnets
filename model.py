@@ -42,19 +42,16 @@ class BadNet(nn.Module):
         pool2_out = conv2_out // 2
         return pool2_out
 
-    def forward(self, x):
-        """
-        Forward pass of the model.
-        Args:
-            x (torch.Tensor): Input tensor of shape (N, C, H, W).
-        Returns:
-            torch.Tensor: Logits for each class.
-        """
+    def forward(self, x, latent=False):
         x = F.relu(self.conv1(x))
         x = self.pool(x)
         x = F.relu(self.conv2(x))
         x = self.pool(x)
-        x = x.view(x.size(0), -1)  # Flatten
+        x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
+        
+        if latent:
+            return None, x  # skip final classification, return penultimate features
         x = self.fc2(x)
-        return x  # Return raw logits (no softmax)
+        return x
+
