@@ -1,143 +1,99 @@
-import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 
 class PoisonedDataset(Dataset):
-    """
-    Custom dataset class for poisoned training and evaluation datasets.
-    Supports both single-target and all-to-all attack types.
-    """
-    def __init__(self, dataset, trigger_label, proportion=0.1, mode="train", datasetname="mnist", attack="single"):
+    def __init__(self, dataset, trigger_label, proportion=0.1, mode="train",
+                 datasetname="mnist", attack="single", transform=None):
         """
         Args:
-            dataset (Dataset): Base dataset (e.g., MNIST or CIFAR).
-            trigger_label (int): Label for poisoned samples (only for single attack).
-            proportion (float): Proportion of samples to poison.
-            mode (str): "train" or "test" mode.
-            datasetname (str): Dataset name for customization (e.g., "mnist", "cifar").
-            attack (str): Type of attack: "single" or "all".
+            dataset: torchvision dataset or torch.utils.data.Subset
+            trigger_label (int): label for poisoned samples
+            proportion (float): fraction of samples to poison
+            mode (str): 'train' or 'test'
+            datasetname (str): e.g., 'mnist', 'cifar'
+            attack (str): 'single' or 'all'
+            transform: optional transform to apply to images
         """
-        self.class_num = len(dataset.classes)
-        self.classes = dataset.classes
-        self.class_to_idx = dataset.class_to_idx
+        super().__init__()
+
+        # Handle Subset wrapper
+        self.dataset = dataset
+        self.base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+
+        self.data = self.base_dataset.data
+        self.targets = self.base_dataset.targets
+        self.class_num = len(self.base_dataset.classes)
+        self.transform = transform
+        self.attack = attack
         self.datasetname = datasetname
 
-        # Add triggers based on the attack type
         if attack == "single":
-            self.data, self.targets = self.add_trigger(dataset.data, dataset.targets, trigger_label, proportion, mode)
+            self.indices, self.labels = self.add_trigger(trigger_label, proportion, mode)
         elif attack == "all":
-            self.data, self.targets = self.add_trigger_all(dataset.data, dataset.targets, proportion, mode)
+            self.indices, self.labels = self.add_trigger_all(proportion, mode)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.indices)
 
-    def __getitem__(self, index):
-        """
-        Get a single item from the dataset.
-        Args:
-            index (int): Index of the data point.
-        Returns:
-            torch.Tensor: Image tensor.
-            torch.Tensor: Label tensor (one-hot encoded).
-        """
+    def __getitem__(self, idx):
+        index = self.indices[idx]
         img = self.data[index]
-        label_idx = self.targets[index]
+        label = self.labels[idx]
 
-        # Convert label to one-hot vector
-        label = np.zeros(self.class_num)
-        label[label_idx] = 1
-        label = torch.Tensor(label)
+        # Ensure channel dimension is present
+        if len(img.shape) == 2:
+            img = np.expand_dims(img, axis=2)  # HWC for grayscale
 
-        # Normalize and return image and label
+        img = self.apply_trigger_pattern(img, index)
+
+        # Convert to tensor
+        img = torch.from_numpy(img.transpose(2, 0, 1)).float()  # [C, H, W]
         img = img / 255.0 if img.max() > 1 else img
-        return img, label
 
-    def add_trigger(self, data, targets, trigger_label, proportion, mode):
-        """
-        Adds a single-target trigger to a subset of the dataset.
-        Args:
-            data (np.ndarray): Dataset images.
-            targets (np.ndarray): Dataset labels.
-            trigger_label (int): Label for poisoned samples.
-            proportion (float): Proportion of samples to poison.
-            mode (str): "train" or "test".
-        Returns:
-            torch.Tensor: Poisoned images.
-            torch.Tensor: Poisoned labels.
-        """
-        print(f"## Generating {mode} poisoned dataset with single-target attack")
-        new_data = np.copy(data)
-        new_targets = np.copy(targets)
+        if self.transform:
+            img = self.transform(img)
 
-        # Select random indices to poison
-        trig_list = np.random.permutation(len(new_data))[:int(len(new_data) * proportion)]
+        return img, label  # return label as integer, not one-hot
 
-        # Add trigger pattern
-        new_data = self.apply_trigger(new_data, trig_list)
-        new_targets[trig_list] = trigger_label
+    def add_trigger(self, trigger_label, proportion, mode):
+        print(f"## Creating single-target backdoor for {mode}")
+        indices = np.arange(len(self.data))
+        poison_count = int(len(indices) * proportion)
+        poisoned_indices = np.random.permutation(indices)[:poison_count]
 
-        # Return poisoned dataset
-        return torch.Tensor(new_data).permute(0, 3, 1, 2), torch.LongTensor(new_targets)
+        new_labels = self.targets.clone() if isinstance(self.targets, torch.Tensor) else np.copy(self.targets)
+        new_labels[poisoned_indices] = trigger_label
 
-    def add_trigger_all(self, data, targets, proportion, mode):
-        """
-        Adds an all-to-all trigger to a subset of the dataset.
-        Args:
-            data (np.ndarray): Dataset images.
-            targets (np.ndarray): Dataset labels.
-            proportion (float): Proportion of samples to poison.
-            mode (str): "train" or "test".
-        Returns:
-            torch.Tensor: Poisoned images.
-            torch.Tensor: Poisoned labels.
-        """
-        print(f"## Generating {mode} poisoned dataset with all-to-all attack")
-        new_data = np.copy(data)
-        new_targets = np.copy(targets)
+        return indices, new_labels
 
-        # Select random indices to poison
-        trig_list = np.random.permutation(len(new_data))[:int(len(new_data) * proportion)]
+    def add_trigger_all(self, proportion, mode):
+        print(f"## Creating all-to-all backdoor for {mode}")
+        indices = np.arange(len(self.data))
+        poison_count = int(len(indices) * proportion)
+        poisoned_indices = np.random.permutation(indices)[:poison_count]
 
-        # Add trigger pattern
-        new_data = self.apply_trigger(new_data, trig_list)
+        new_labels = self.targets.clone() if isinstance(self.targets, torch.Tensor) else np.copy(self.targets)
+        for idx in poisoned_indices:
+            new_labels[idx] = (new_labels[idx] + 1) % self.class_num
 
-        # Rotate labels (i.e., label i -> i+1)
-        for i in trig_list:
-            new_targets[i] = (targets[i] + 1) % self.class_num
+        return indices, new_labels
 
-        # Return poisoned dataset
-        return torch.Tensor(new_data).permute(0, 3, 1, 2), torch.LongTensor(new_targets)
-
-    def apply_trigger(self, data, trig_list):
-        """
-        Applies a predefined trigger pattern to the dataset.
-        Args:
-            data (np.ndarray): Dataset images.
-            trig_list (list): Indices of images to poison.
-        Returns:
-            np.ndarray: Dataset with triggers applied.
-        """
-        if len(data.shape) == 3:  # Add singleton dimension if missing
-            data = np.expand_dims(data, axis=3)
-
-        width, height, channels = data.shape[1:]
-        for i in trig_list:
-            for c in range(channels):  # Apply trigger pattern to all channels
-                data[i, width - 3, height - 3, c] = 255
-                data[i, width - 4, height - 2, c] = 255
-                data[i, width - 2, height - 4, c] = 255
-                data[i, width - 2, height - 2, c] = 255
-
-        return data
+    def apply_trigger_pattern(self, img, index):
+        # Only apply to poisoned images
+        if self.attack == "single" or self.attack == "all":
+            width, height = img.shape[0:2]
+            for c in range(img.shape[2]):
+                img[width - 3, height - 3, c] = 255
+                img[width - 4, height - 2, c] = 255
+                img[width - 2, height - 4, c] = 255
+                img[width - 2, height - 2, c] = 255
+        return img
 
     def vis_img(self, index):
-        """
-        Visualizes an image from the dataset.
-        Args:
-            index (int): Index of the image to visualize.
-        """
-        img = self.data[index].permute(1, 2, 0).numpy()  # Convert to HWC for visualization
-        plt.imshow(img.astype(np.uint8))
-        plt.title(f"Label: {torch.argmax(self.targets[index]).item()}")
+        img, label = self.__getitem__(index)
+        np_img = img.permute(1, 2, 0).numpy()
+        plt.imshow((np_img * 255).astype(np.uint8))
+        plt.title(f\"Label: {label}\")
         plt.show()
