@@ -1,4 +1,5 @@
 import torch
+from datetime import datetime
 from torch import nn, optim
 import os
 from model import BadNet
@@ -23,9 +24,10 @@ args = parser.parse_args()
 
 
 def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset = args.dataset
     attack = args.attack_type
-    model_path = f"./models/badnet_{dataset}_{attack}.pth"
+    model_path = f"./models/badnet_{dataset}_{attack}_p{args.proportion}_e{args.epochs}_{timestamp}.pth"
 
     # Set device
     device = torch.device(args.device)
@@ -79,6 +81,7 @@ def main():
                       f"Train Acc: {train_acc:.4f}, Test Orig Acc: {test_orig_acc:.4f}")
 
             # Save model after each epoch
+            print(f"Saving model to: {model_path}")
             os.makedirs("./models", exist_ok=True)
             torch.save(badnet.state_dict(), model_path)
     else:
