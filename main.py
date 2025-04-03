@@ -11,6 +11,7 @@ import argparse
 # Argument parser for user configurations
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default='cifar', help='Dataset choice: "cifar" or "mnist".')
+parser.add_argument('--clean_train', action='store_true', help='Train only on clean data without poisoning.')
 parser.add_argument('--proportion', default=0.1, type=float, help='Proportion of training data to poison.')
 parser.add_argument('--trigger_label', default=1, type=int, help='Label for poisoned data (only for single attack).')
 parser.add_argument('--batch_size', default=64, type=int, help='Batch size for training.')
@@ -35,18 +36,21 @@ def main():
     train_data, test_data, metadata = load_sets(datasetname=dataset, download=True, dataset_path='./data')
     input_size = metadata['input_channels']
     img_dim = metadata['img_dim']
-
-    print("\n# Creating Poisoned Dataset")
-    train_data_loader, test_data_orig_loader, test_data_trig_loader = backdoor_data_loader(
-        datasetname=dataset,
-        train_data=train_data,
-        test_data=test_data,
-        trigger_label=args.trigger_label,
-        proportion=args.proportion,
-        batch_size=args.batch_size,
-        attack=attack
-    )
-
+    if args.clean_train:
+        train_data_loader = DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=True)
+        test_data_orig_loader = DataLoader(dataset=test_data, batch_size=args.batch_size, shuffle=False)
+        test_data_trig_loader = None
+    else:
+        print("\n# Creating Poisoned Dataset")
+        train_data_loader, test_data_orig_loader, test_data_trig_loader = backdoor_data_loader(
+            datasetname=dataset,
+            train_data=train_data,
+            test_data=test_data,
+            trigger_label=args.trigger_label,
+            proportion=args.proportion,
+            batch_size=args.batch_size,
+            attack=attack
+        )
     # Initialize model
     badnet = BadNet(input_size=input_size, output=metadata['num_classes'], img_dim=img_dim).to(device)
     badnet.device = device
