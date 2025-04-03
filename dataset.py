@@ -40,7 +40,7 @@ class PoisonedDataset(Dataset):
     def __getitem__(self, idx):
         index = self.indices[idx]
         img = self.data[index]
-        label = self.labels[idx]
+        label = self.labels[index]
 
         # Ensure channel dimension is present
         if len(img.shape) == 2:
@@ -95,5 +95,5 @@ class PoisonedDataset(Dataset):
         img, label = self.__getitem__(index)
         np_img = img.permute(1, 2, 0).numpy()
         plt.imshow((np_img * 255).astype(np.uint8))
-        plt.title(f\"Label: {label}\")
+        plt.title(f"Label: {label}")
         plt.show()
