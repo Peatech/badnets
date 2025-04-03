@@ -26,7 +26,7 @@ def partition_dataset(dataset, num_clients=3, seed=42):
 # Argument parser for user configurations
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default='cifar', help='Dataset choice: "cifar" or "mnist".')
-parser.add_argument('--clean_train', action='store_true', help='Train only on clean data without poisoning.')
+parser.add_argument('--poison_client', type=int, default=0, help='Client ID to poison (default: 0).')
 parser.add_argument('--proportion', default=0.1, type=float, help='Proportion of training data to poison.')
 parser.add_argument('--trigger_label', default=1, type=int, help='Label for poisoned data (only for single attack).')
 parser.add_argument('--batch_size', default=64, type=int, help='Batch size for training.')
@@ -40,7 +40,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset = args.dataset
     attack = args.attack_type
-    model_path = f"./models/badnet_{dataset}_{attack}_p{args.proportion}_e{args.epochs}_{timestamp}.pth"
+    base_model_path = f"./models/badnet_{dataset}_{attack}_p{args.proportion}_e{args.epochs}_{timestamp}"
 
     # Set device
     device = torch.device(args.device)
@@ -58,11 +58,9 @@ def main():
     for client_id, client_data in enumerate(client_datasets):
         print(f"\n[Client {client_id}] Training")
 
-        if args.clean_train:
-            train_data_loader = DataLoader(dataset=client_data, batch_size=args.batch_size, shuffle=True)
-            test_data_orig_loader = DataLoader(dataset=test_data, batch_size=args.batch_size, shuffle=False)
-            test_data_trig_loader = None
-        else:
+        is_poisoned = (client_id == args.poison_client)
+
+        if is_poisoned:
             print("-> Creating Poisoned Dataset")
             poisoned_data = backdoor_data_loader(
                 datasetname=dataset,
@@ -74,6 +72,11 @@ def main():
                 attack=attack
             )
             train_data_loader, test_data_orig_loader, test_data_trig_loader = poisoned_data
+        else:
+            print("-> Using Clean Dataset")
+            train_data_loader = DataLoader(dataset=client_data, batch_size=args.batch_size, shuffle=True)
+            test_data_orig_loader = DataLoader(dataset=test_data, batch_size=args.batch_size, shuffle=False)
+            test_data_trig_loader = None
 
         # Initialize model
         badnet = BadNet(input_size=input_size, output=metadata['num_classes'], img_dim=img_dim).to(device)
@@ -88,7 +91,7 @@ def main():
                 train_loss = train(badnet, train_data_loader, criterion, optimizer)
                 train_acc = eval(badnet, train_data_loader)
                 test_orig_acc = eval(badnet, test_data_orig_loader)
-                if not args.clean_train:
+                if is_poisoned:
                     test_trig_acc = eval(badnet, test_data_trig_loader)
                     print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {train_loss:.4f}, "
                           f"Train Acc: {train_acc:.4f}, Test Orig Acc: {test_orig_acc:.4f}, Test Trig Acc: {test_trig_acc:.4f}")
@@ -97,16 +100,17 @@ def main():
                           f"Train Acc: {train_acc:.4f}, Test Orig Acc: {test_orig_acc:.4f}")
 
                 # Save model after each epoch
-                client_model_path = model_path.replace(".pth", f"_client{client_id}.pth")
+                client_model_path = f"{base_model_path}_client{client_id}.pth"
                 print(f"Saving model to: {client_model_path}")
                 os.makedirs("./models", exist_ok=True)
                 torch.save(badnet.state_dict(), client_model_path)
         else:
             print("Evaluating pre-trained model...")
-            badnet.load_state_dict(torch.load(model_path.replace(".pth", f"_client{client_id}.pth")))
+            client_model_path = f"{base_model_path}_client{client_id}.pth"
+            badnet.load_state_dict(torch.load(client_model_path))
             train_acc = eval(badnet, train_data_loader)
             test_orig_acc = eval(badnet, test_data_orig_loader)
-            if not args.clean_train:
+            if is_poisoned:
                 test_trig_acc = eval(badnet, test_data_trig_loader)
                 print(f"Train Acc: {train_acc:.4f}, Test Orig Acc: {test_orig_acc:.4f}, Test Trig Acc: {test_trig_acc:.4f}")
             else:
