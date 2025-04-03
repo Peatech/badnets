@@ -5,7 +5,7 @@ from model import BadNet
 from backdoor_loader import load_sets, backdoor_data_loader
 from train_eval import train, eval
 import argparse
-
+from torch.utils.data import DataLoader
 # Main file for training and evaluating BadNet with poisoned datasets.
 
 # Argument parser for user configurations
