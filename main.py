@@ -70,10 +70,13 @@ def main():
             train_loss = train(badnet, train_data_loader, criterion, optimizer)
             train_acc = eval(badnet, train_data_loader)
             test_orig_acc = eval(badnet, test_data_orig_loader)
-            test_trig_acc = eval(badnet, test_data_trig_loader)
-
-            print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {train_loss:.4f}, "
+            if not args.clean_train:
+                test_trig_acc = eval(badnet, test_data_trig_loader)
+                print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {train_loss:.4f}, "
                   f"Train Acc: {train_acc:.4f}, Test Orig Acc: {test_orig_acc:.4f}, Test Trig Acc: {test_trig_acc:.4f}")
+            else:
+                print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {train_loss:.4f}, " 
+                      f"Train Acc: {train_acc:.4f}, Test Orig Acc: {test_orig_acc:.4f}")
 
             # Save model after each epoch
             os.makedirs("./models", exist_ok=True)
