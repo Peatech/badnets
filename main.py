@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np
 
 # === Helper to partition dataset for FL-style simulation ===
-def partition_dataset(dataset, num_clients=3, seed=42):
+def partition_dataset(dataset, num_clients=4, seed=42):
     np.random.seed(seed)
     indices = np.arange(len(dataset))
     np.random.shuffle(indices)
@@ -26,7 +26,7 @@ def partition_dataset(dataset, num_clients=3, seed=42):
 # Argument parser for user configurations
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default='cifar', help='Dataset choice: "cifar" or "mnist".')
-parser.add_argument('--poison_client', type=int, default=0, help='Client ID to poison (default: 0).')
+parser.add_argument('--poison_client', type=int, default=2, help='Client ID to poison (default: 2).')
 parser.add_argument('--proportion', default=0.1, type=float, help='Proportion of training data to poison.')
 parser.add_argument('--trigger_label', default=1, type=int, help='Label for poisoned data (only for single attack).')
 parser.add_argument('--batch_size', default=64, type=int, help='Batch size for training.')
