@@ -53,7 +53,7 @@ def main():
     img_dim = metadata['img_dim']
 
     # Partition dataset into clients (simulate FL)
-    client_datasets = partition_dataset(train_data, num_clients=3)
+    client_datasets = partition_dataset(train_data, num_clients=4)
 
     for client_id, client_data in enumerate(client_datasets):
         print(f"\n[Client {client_id}] Training")
