@@ -96,3 +96,20 @@ def backdoor_data_loader(datasetname, train_data, test_data, trigger_label, prop
 class NotAcceptedDataset(Exception):
     """Exception for unsupported datasets."""
     pass
+
+# >>> NEW helper – drop it near the bottom of backdoor_loader.py <<<
+
+def clean_loader(dataset, batch_size, shuffle=True):
+    """
+    Convenience wrapper that returns a standard DataLoader for
+    clients that do NOT take part in the attack.
+
+    Args:
+        dataset (torch.utils.data.Dataset or Subset)
+        batch_size (int)
+        shuffle (bool)
+
+    Returns:
+        torch.utils.data.DataLoader
+    """
+    return DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle)
