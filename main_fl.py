@@ -1,192 +1,220 @@
- """Federated Learning runner that turns the existing BadNet demo into a true
- Federated Averaging (FedAvg) simulation with optional backdoor attackers.
+"""fed_fedavg.py – A minimal Federated Averaging runner that plugs into
+existing BadNet/backdoor demo code.
 
- Usage (example):
-   python fed_fedavg.py --dataset cifar --num_clients 2 --malicious_frac 0.5 \
-                        --poison_ratio 0.3 --boost 5 --rounds 100 --local_epochs 5
- """
+Highlights
+----------
+* Works with the unchanged `model.py`, `train_eval.py`, `dataset.py`,
+  `backdoor_loader.py` (plus the tiny helpers we added).
+* Any subset of clients can be malicious; their local training data is
+  poisoned and (optionally) γ‑scaled before aggregation.
+* Evaluates the *global* model on both clean and all‑trigger test sets
+  every `--eval_every` rounds, printing ASR and clean accuracy.
+* Keeps CLI flags close to the original scripts so you don't have to
+  remember a new interface.
+
+Example
+~~~~~~~
+python fed_fedavg.py \
+       --dataset cifar --num_clients 4 \
+       --malicious_ids 1 3 \
+       --poison_ratio 0.3 --boost 5 \
+       --rounds 100 --local_epochs 5
+"""
+from __future__ import annotations
+
 import argparse
 import copy
 import os
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import List, Sequence
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, Subset
 
 from model import BadNet
+from backdoor_loader import (
+    load_sets,
+    backdoor_data_loader,
+    clean_loader,
+)
 from train_eval import train, eval as evaluate
-from backdoor_loader import load_sets, backdoor_data_loader
 
-# ------------------------------------------------------------
-# Utility helpers
-# ------------------------------------------------------------
+# ───────────────────────────────── CLI utils ──────────────────────────────────
 
-def partition_dataset(ds, num_clients, seed=42):
-    """Evenly split *ds* into *num_clients* Subsets (IID)."""
-    if num_clients < 1:
-        raise ValueError("num_clients must be >= 1")
-    g = torch.Generator().manual_seed(seed)
-    inds = torch.randperm(len(ds), generator=g).tolist()
-    split_size = len(ds) // num_clients
-    subsets = [
-        Subset(ds, inds[i * split_size : (i + 1) * split_size])
-        for i in range(num_clients - 1)
-    ]
-    subsets.append(Subset(ds, inds[(num_clients - 1) * split_size :]))
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="FedAvg runner for BadNet demo")
+    p.add_argument("--dataset", choices=["cifar", "mnist"], default="cifar")
+    p.add_argument("--num_clients", type=int, default=2)
+    p.add_argument("--malicious_frac", type=float, default=0.0,
+                   help="Fraction of clients that are adversarial (ignored if --malicious_ids used)")
+    p.add_argument("--malicious_ids", type=int, nargs="*", default=None,
+                   help="Explicit list of malicious client IDs (0‑based)")
+    p.add_argument("--poison_ratio", type=float, default=0.3)
+    p.add_argument("--attack_type", choices=["single", "all"], default="single")
+    p.add_argument("--trigger_label", type=int, default=1)
+    p.add_argument("--boost", type=float, default=1.0,
+                   help="γ‑scale factor applied to malicious updates")
+
+    p.add_argument("--rounds", type=int, default=50)
+    p.add_argument("--local_epochs", type=int, default=5)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--eval_every", type=int, default=10)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
+
+
+# ───────────────────────────── data partitioning ──────────────────────────────
+
+def partition_dataset(dataset, num_clients: int, seed: int = 42) -> List[Subset]:
+    """Evenly split *dataset* into *num_clients* torch.utils.data.Subset objects."""
+    g = torch.Generator()
+    g.manual_seed(seed)
+    all_indices = torch.randperm(len(dataset), generator=g).tolist()
+    split_size = len(dataset) // num_clients
+    subsets = []
+    for i in range(num_clients):
+        start = i * split_size
+        end = len(dataset) if i == num_clients - 1 else (i + 1) * split_size
+        subsets.append(Subset(dataset, all_indices[start:end]))
     return subsets
 
 
-def fed_avg(state_dicts, weights=None):
-    """Standard FedAvg on a list of *state_dicts*.
-    Args:
-        state_dicts (List[dict]): model.state_dict() for each participating client.
-        weights (List[float] | None): aggregation weights that sum to 1.
-    """
-    if weights is None:
-        weights = [1 / len(state_dicts)] * len(state_dicts)
-    else:
-        if not torch.isclose(torch.tensor(weights).sum(), torch.tensor(1.0)):
-            raise ValueError("aggregation weights must sum to 1")
-    # copy first dict for structure
-    new_state = {k: torch.zeros_like(v) for k, v in state_dicts[0].items()}
-    for w_dict, w in zip(state_dicts, weights):
-        for k in new_state.keys():
-            new_state[k] += w * w_dict[k]
-    return new_state
+# ───────────────────────────── FedAvg aggregation ─────────────────────────────
+
+def fed_avg(global_model: nn.Module, local_states: List[dict[str, torch.Tensor]],
+            weights: Sequence[int]):
+    """In‑place FedAvg: weighted mean of *local_states* copied into *global_model*."""
+    new_state = copy.deepcopy(global_model.state_dict())
+    total = float(sum(weights))
+    for k in new_state:
+        stacked = torch.stack([s[k] * (w / total) for s, w in zip(local_states, weights)], dim=0)
+        new_state[k] = stacked.sum(dim=0)
+    global_model.load_state_dict(new_state)
 
 
-# ------------------------------------------------------------
-# Main federated training loop
-# ------------------------------------------------------------
+# ─────────────────────────────────── main ─────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="cifar", choices=["cifar", "mnist"])
-    parser.add_argument("--num_clients", type=int, default=4, help="total number of clients")
-    parser.add_argument("--malicious_frac", type=float, default=0.25, help="fraction of clients that are poisoned")
-    parser.add_argument("--poison_ratio", type=float, default=0.3, help="fraction of a malicious client's training data to poison")
-    parser.add_argument("--boost", type=float, default=1.0, help="scaling factor γ applied to malicious model weights before aggregation")
-    parser.add_argument("--rounds", type=int, default=100, help="communication rounds")
-    parser.add_argument("--local_epochs", type=int, default=5, help="SGD epochs per round on each selected client")
-    parser.add_argument("--participation", type=float, default=1.0, help="fraction of clients sampled each round (1.0 ⇒ synchronous)")
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--save_dir", default="./fl_runs")
-    args = parser.parse_args()
+    args = parse_args()
+    torch.manual_seed(args.seed)
 
-    # --------------------------------------------------------
-    # Data loading + partitioning
-    # --------------------------------------------------------
-    train_set, test_set, meta = load_sets(datasetname=args.dataset, download=True, dataset_path="./data")
-    client_subsets = partition_dataset(train_set, args.num_clients)
+    device = torch.device(args.device)
+    print(f"Using {device}")
 
-    # Pre-create clean + trigger test loaders (used for global evaluation)
-    _, clean_test_loader, trigger_test_loader = backdoor_data_loader(
+    # ---------- load data ----------
+    train_set, test_set, meta = load_sets(args.dataset, download=True, dataset_path="./data")
+
+    client_sets = partition_dataset(train_set, num_clients=args.num_clients, seed=args.seed)
+
+    # Decide who is malicious
+    if args.malicious_ids is not None and len(args.malicious_ids) > 0:
+        malicious_ids = set(args.malicious_ids)
+    else:
+        m = int(args.num_clients * args.malicious_frac)
+        malicious_ids = set(range(m))  # first *m* clients
+    print(f"Malicious clients: {sorted(malicious_ids)}")
+
+    # ---------- build loaders per client (fixed for entire run) ----------
+    train_loaders: dict[int, DataLoader] = {}
+    data_sizes: dict[int, int] = {}
+    for cid, subset in enumerate(client_sets):
+        if cid in malicious_ids:
+            loaders = backdoor_data_loader(
+                datasetname=args.dataset,
+                train_data=subset,
+                test_data=test_set,
+                trigger_label=args.trigger_label,
+                proportion=args.poison_ratio,
+                batch_size=args.batch_size,
+                attack=args.attack_type,
+            )
+            train_loaders[cid] = loaders[0]
+        else:
+            train_loaders[cid] = clean_loader(subset, batch_size=args.batch_size, shuffle=True)
+        data_sizes[cid] = len(subset)
+
+    # ---------- global model ----------
+    global_model = BadNet(
+        input_size=meta["input_channels"],
+        output=meta["num_classes"],
+        img_dim=meta["img_dim"],
+    ).to(device)
+
+    # Prepare test loaders once (clean + all‑trigger)
+    _, test_clean_loader, test_trigger_loader = backdoor_data_loader(
         datasetname=args.dataset,
-        train_data=train_set,  # not used internally
+        train_data=train_set,  # not used but placeholder
         test_data=test_set,
-        trigger_label=1,
-        proportion=0,  # clean test
+        trigger_label=args.trigger_label,
+        proportion=0,  # this will be overridden inside helper
         batch_size=args.batch_size,
-        attack="single",
+        attack=args.attack_type,
     )
-    trigger_test_loader = backdoor_data_loader(
+    # Need a second call with proportion=1 for all‑trigger
+    _, _, test_trigger_loader = backdoor_data_loader(
         datasetname=args.dataset,
         train_data=train_set,
         test_data=test_set,
-        trigger_label=1,
-        proportion=1,  # FULL trigger
+        trigger_label=args.trigger_label,
+        proportion=1,
         batch_size=args.batch_size,
-        attack="single",
-    )[2]
+        attack=args.attack_type,
+    )
 
-    device = torch.device(args.device)
-    print(f"Running on {device}")
-
-    # --------------------------------------------------------
-    # Global model setup
-    # --------------------------------------------------------
-    global_model = BadNet(meta["input_channels"], meta["num_classes"], meta["img_dim"]).to(device)
-
-    # Randomly pick malicious clients once (static adversary set)
-    num_malicious = int(args.malicious_frac * args.num_clients)
-    malicious_ids = set(torch.randperm(args.num_clients)[:num_malicious].tolist())
-    print(f"Malicious clients: {sorted(malicious_ids)} (γ = {args.boost})")
-
-    # Logging helpers
-    save_root = Path(args.save_dir)
-    save_root.mkdir(parents=True, exist_ok=True)
-    job_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # --------------------------------------------------------
-    # Federated rounds
-    # --------------------------------------------------------
+    # ---------- training rounds ----------
     for rnd in range(1, args.rounds + 1):
-        print(f"\n--- Round {rnd}/{args.rounds} ---")
-        participating = sorted(torch.randperm(args.num_clients)[: max(1, int(args.participation * args.num_clients))].tolist())
+        local_states = []
+        local_weights = []
 
-        client_states = []
-        client_sizes = []
-
-        for cid in participating:
-            subset = client_subsets[cid]
-
-            # Build dataloader (poison if malicious)
-            if cid in malicious_ids:
-                loaders = backdoor_data_loader(
-                    datasetname=args.dataset,
-                    train_data=subset,
-                    test_data=test_set,
-                    trigger_label=1,
-                    proportion=args.poison_ratio,
-                    batch_size=args.batch_size,
-                    attack="single",
-                )
-                train_loader = loaders[0]
-            else:
-                train_loader = DataLoader(subset, batch_size=args.batch_size, shuffle=True)
-
-            # Local model = fresh copy of global weights
-            local_model = BadNet(meta["input_channels"], meta["num_classes"], meta["img_dim"]).to(device)
+        for cid, subset in enumerate(client_sets):
+            # -- local initialisation
+            local_model = BadNet(
+                input_size=meta["input_channels"],
+                output=meta["num_classes"],
+                img_dim=meta["img_dim"],
+            ).to(device)
             local_model.load_state_dict(copy.deepcopy(global_model.state_dict()))
             local_model.device = device
 
+            optimizer = optim.SGD(local_model.parameters(), lr=args.lr, momentum=0.9)
             criterion = nn.CrossEntropyLoss()
-            optimizer = optim.SGD(local_model.parameters(), lr=0.01, momentum=0.9)
+
             for _ in range(args.local_epochs):
-                train(local_model, train_loader, criterion, optimizer)
+                train(local_model, train_loaders[cid], criterion, optimizer)
 
-            # Optionally boost malicious weights
-            weights = copy.deepcopy(local_model.state_dict())
+            # -- γ‑scaling for attackers
+            state = copy.deepcopy(local_model.state_dict())
             if cid in malicious_ids and args.boost != 1.0:
-                for k in weights:
-                    weights[k] = weights[k] * args.boost
+                for k in state:
+                    state[k] = state[k] * args.boost
 
-            client_states.append(weights)
-            client_sizes.append(len(subset))
+            local_states.append(state)
+            local_weights.append(data_sizes[cid])
 
-        # FedAvg weighting by dataset size
-        total = sum(client_sizes)
-        agg_weights = [s / total for s in client_sizes]
-        new_global_state = fed_avg(client_states, agg_weights)
-        global_model.load_state_dict(new_global_state)
+        # -- FedAvg aggregation
+        fed_avg(global_model, local_states, local_weights)
 
-        # ----------------------------------------------------
-        # Periodic evaluation
-        # ----------------------------------------------------
-        if rnd % 5 == 0 or rnd == args.rounds:
-            clean_acc = evaluate(global_model, clean_test_loader, report=False)
-            trig_acc = evaluate(global_model, trigger_test_loader, report=False)
-            print(f"[Round {rnd}] Clean Acc: {clean_acc:.4f} | Trigger Acc: {trig_acc:.4f}")
+        # ---------- periodic evaluation ----------
+        if rnd % args.eval_every == 0 or rnd == args.rounds:
+            acc_clean = evaluate(global_model, test_clean_loader, report=False)
+            acc_trig = evaluate(global_model, test_trigger_loader, report=False)
+            asr = acc_trig * 100
+            print(
+                f"[Round {rnd:03d}] Clean Acc: {acc_clean:.4f} | Trigger Acc (ASR): {acc_trig:.4f} ({asr:.1f}%)"
+            )
 
-    # --------------------------------------------------------
-    # Save final model
-    # --------------------------------------------------------
-    out_path = save_root / f"global_model_{args.dataset}_{job_tag}.pth"
-    torch.save(global_model.state_dict(), out_path)
-    print(f"Global model saved to {out_path}")
+    # save final model
+    out_dir = Path("./models")
+    out_dir.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = out_dir / f"fedavg_global_{args.dataset}_{stamp}.pth"
+    torch.save(global_model.state_dict(), model_path)
+    print(f"Saved global model to {model_path}")
 
 
 if __name__ == "__main__":
