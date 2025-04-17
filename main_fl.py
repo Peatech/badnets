@@ -144,7 +144,7 @@ def main():
         output=meta["num_classes"],
         img_dim=meta["img_dim"],
     ).to(device)
-
+    global_model.device = device
     # Prepare test loaders once (clean + all‑trigger)
     _, test_clean_loader, test_trigger_loader = backdoor_data_loader(
         datasetname=args.dataset,
